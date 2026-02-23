@@ -1,0 +1,30 @@
+{
+  "name": "openclaw-smartlead",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Smartlead API + webhook reply forwarding plugin for OpenClaw",
+  "license": "MIT",
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "smartlead",
+    "smartlead-ai",
+    "webhook",
+    "email"
+  ],
+  "files": [
+    "index.ts",
+    "openclaw.plugin.json",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "openclaw": ">=2025.0.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
