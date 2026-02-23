@@ -7,6 +7,10 @@ This plugin does two things:
 1. Registers Smartlead tools for lead lookup, message history, campaign webhooks, and raw API requests.
 2. Exposes a plugin HTTP route that accepts Smartlead reply webhooks and forwards them into OpenClaw `/hooks/agent` so the agent can notify a chat channel and summarize the prior thread.
 
+## npm Package
+
+Published package name (configured for releases): `@jzakirov/smartlead`
+
 ## Installation
 
 From local path (dev/link):
