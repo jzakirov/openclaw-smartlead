@@ -1,11 +1,14 @@
 # openclaw-smartlead
 
-Smartlead API + webhook automation plugin for OpenClaw.
+Smartlead reply-webhook bridge for OpenClaw.
 
-This plugin does two things:
+This plugin is intentionally narrow:
 
-1. Registers Smartlead tools for lead lookup, message history, campaign webhooks, and raw API requests.
-2. Exposes a plugin HTTP route that accepts Smartlead reply webhooks and forwards them into OpenClaw `/hooks/agent` so the agent can notify a chat channel and summarize the prior thread.
+1. It exposes a webhook endpoint for Smartlead campaign webhooks.
+2. It forwards `EMAIL_REPLY` events to OpenClaw `/hooks/agent`.
+3. The agent then uses the `smartlead` CLI (and bundled skill) to fetch thread history and post a summary.
+
+It does not call Smartlead API directly and it does not register Smartlead API tools inside the plugin runtime.
 
 ## npm Package
 
@@ -42,9 +45,13 @@ Because this plugin forwards Smartlead events to OpenClaw `/hooks/agent`, enable
 }
 ```
 
+The plugin can usually auto-derive `/hooks/agent` URL and hook token from this OpenClaw config.
+
 ## Plugin Configuration
 
 Configure under `plugins.entries.smartlead.config`:
+
+### Minimal setup (recommended)
 
 ```json5
 {
@@ -53,23 +60,8 @@ Configure under `plugins.entries.smartlead.config`:
       smartlead: {
         enabled: true,
         config: {
-          apiKey: "${SMARTLEAD_API_KEY}",
-          apiBaseUrl: "https://server.smartlead.ai/api/v1",
-
-          inboundWebhookPath: "/smartlead/webhook",
-          webhookSecret: "optional-smartlead-secret-key",
-
-          openclawAgentHookUrl: "http://127.0.0.1:18789/hooks/agent",
-          openclawHookToken: "${OPENCLAW_HOOKS_TOKEN}",
-
-          hookName: "Smartlead",
-          hookAgentId: "main",
           hookChannel: "slack",
-          hookTo: "C0123456789",
-          hookWakeMode: "now",
-          hookDeliver: true,
-
-          replyEventTypes: ["EMAIL_REPLY"]
+          webhookSecret: "optional-smartlead-secret"
         }
       }
     }
@@ -77,10 +69,40 @@ Configure under `plugins.entries.smartlead.config`:
 }
 ```
 
-Notes:
+### Common optional overrides
 
-- `webhookSecret` is optional. If set, the plugin validates it against Smartlead payload `secret_key` (and also `x-smartlead-secret` / `?token=` as fallbacks).
-- `openclawAgentHookUrl` should usually be your local gateway `/hooks/agent` URL.
+Most setups do not need these. Only set them when OpenClaw cannot auto-derive values.
+
+```json5
+{
+  plugins: {
+    entries: {
+      smartlead: {
+        enabled: true,
+        config: {
+          hookChannel: "slack",
+          hookAgentId: "main",
+          webhookSecret: "optional-smartlead-secret",
+
+          // Optional overrides (normally auto-derived from OpenClaw config)
+          openclawAgentHookUrl: "http://127.0.0.1:18789/hooks/agent",
+          openclawHookToken: "${OPENCLAW_HOOKS_TOKEN}",
+
+          // Optional path override (default: /smartlead/webhook)
+          inboundWebhookPath: "/smartlead/webhook"
+        }
+      }
+    }
+  }
+}
+```
+
+Notes
+
+- `webhookSecret` is optional. If set, the plugin validates it against Smartlead payload `secret_key` (and also `Authorization`, `x-smartlead-secret`, and `x-webhook-secret` headers).
+- `openclawAgentHookUrl` and `openclawHookToken` are usually auto-derived from OpenClaw `gateway` / `hooks` config.
+- `hookChannel` is the main field most users care about for reply alerts.
+- The plugin currently accepts `EMAIL_REPLY` webhooks (reply flow). Other Smartlead webhook event types are ignored.
 
 ## Smartlead Webhook Setup (Campaign)
 
@@ -89,7 +111,7 @@ Smartlead campaign webhook endpoints (per Smartlead docs):
 - `GET /campaigns/<campaign-id>/webhooks`
 - `POST /campaigns/<campaign-id>/webhooks` (add/update)
 
-Example Smartlead webhook registration body (via API or Smartlead UI/API tooling):
+Example Smartlead webhook registration body (via Smartlead UI or `smartlead` CLI):
 
 ```json
 {
@@ -97,25 +119,15 @@ Example Smartlead webhook registration body (via API or Smartlead UI/API tooling
   "name": "OpenClaw Reply Alerts",
   "webhook_url": "https://your-openclaw-host.example.com/smartlead/webhook",
   "event_types": ["EMAIL_REPLY"],
-  "categories": []
+  "categories": ["Interested"]
 }
 ```
 
-You can also use the plugin tool:
+Important:
 
-```text
-smartlead_upsert_campaign_webhook(campaign_id=9181, body={...})
-```
-
-## Tools
-
-- `smartlead_list_campaigns`
-- `smartlead_get_lead_by_email`
-- `smartlead_get_campaign_lead_message_history`
-- `smartlead_list_campaign_webhooks`
-- `smartlead_upsert_campaign_webhook`
-- `smartlead_delete_campaign_webhook`
-- `smartlead_raw_request`
+- `categories` must be a non-empty array in Smartlead webhook upsert requests.
+- `categories` values are Smartlead lead category labels from your workspace (for example `Interested`), not webhook event types.
+- Use `smartlead webhooks upsert --help` for the current `event_types` enum supported by the CLI.
 
 ## Reply Webhook Flow (What happens)
 
@@ -126,7 +138,7 @@ When Smartlead sends an `EMAIL_REPLY` webhook to `inboundWebhookPath`, the plugi
 3. Forwards a prompt to OpenClaw `/hooks/agent`.
 4. The agent is instructed to:
    - Send a message starting with `New lead answer`
-   - Call Smartlead tools (especially message history)
+   - Use the `smartlead` CLI to fetch message history
    - Summarize prior conversation with the lead
 
 ## Final Usage Example (your target flow)
@@ -142,4 +154,4 @@ Resulting behavior after setup:
 
 ## Bundled Skill
 
-The plugin ships a bundled skill at `skills/smartlead/SKILL.md` so the LLM can operate Smartlead more reliably (IDs, webhook payload fields, tool selection, and reply-workflow guidance).
+The plugin ships a bundled skill at `skills/smartlead/SKILL.md` so the LLM can operate Smartlead reliably (ID handling, webhook payload fields, CLI usage, and reply-workflow guidance).

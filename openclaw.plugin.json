@@ -1,61 +1,27 @@
 {
   "id": "smartlead",
   "name": "Smartlead",
-  "description": "Smartlead API tools and Smartlead reply webhook -> OpenClaw hook forwarding.",
-  "version": "0.1.0",
+  "description": "Receives Smartlead webhook events and forwards EMAIL_REPLY events to an openclaw agent. API interaction is done by the agent via the smartlead CLI.",
+  "version": "0.2.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "apiBaseUrl": { "type": "string" },
-      "apiKey": { "type": "string" },
-      "requestTimeoutMs": { "type": "number", "minimum": 1000, "maximum": 120000 },
-      "inboundWebhookPath": { "type": "string" },
-      "webhookSecret": { "type": "string" },
-      "replyEventTypes": {
-        "type": "array",
-        "items": { "type": "string" }
-      },
+      "hookChannel":          { "type": "string" },
+      "hookAgentId":          { "type": "string" },
+      "webhookSecret":        { "type": "string" },
       "openclawAgentHookUrl": { "type": "string" },
-      "openclawHookToken": { "type": "string" },
-      "hookName": { "type": "string" },
-      "hookAgentId": { "type": "string" },
-      "hookSessionKeyPrefix": { "type": "string" },
-      "hookWakeMode": { "type": "string", "enum": ["now", "next-heartbeat"] },
-      "hookDeliver": { "type": "boolean" },
-      "hookChannel": {
-        "type": "string",
-        "enum": ["last", "whatsapp", "telegram", "discord", "slack", "mattermost", "signal", "imessage", "msteams"]
-      },
-      "hookTo": { "type": "string" },
-      "hookModel": { "type": "string" },
-      "hookThinking": { "type": "string" },
-      "hookTimeoutSeconds": { "type": "number", "minimum": 1, "maximum": 3600 },
-      "dedupeTtlSeconds": { "type": "number", "minimum": 1, "maximum": 86400 },
-      "logWebhookPayload": { "type": "boolean" }
+      "openclawHookToken":    { "type": "string" },
+      "inboundWebhookPath":   { "type": "string" }
     },
     "required": []
   },
   "uiHints": {
-    "apiBaseUrl": { "label": "Smartlead API Base URL", "placeholder": "https://server.smartlead.ai/api/v1" },
-    "apiKey": { "label": "Smartlead API Key", "sensitive": true },
-    "requestTimeoutMs": { "label": "Request Timeout (ms)", "advanced": true },
-    "inboundWebhookPath": { "label": "Inbound Webhook Path", "placeholder": "/smartlead/webhook" },
-    "webhookSecret": { "label": "Expected Webhook Secret", "sensitive": true, "help": "Matched against Smartlead payload secret_key (or x-smartlead-secret header / token query)." },
-    "replyEventTypes": { "label": "Reply Event Types", "help": "Defaults to EMAIL_REPLY" },
-    "openclawAgentHookUrl": { "label": "OpenClaw /hooks/agent URL", "placeholder": "http://127.0.0.1:18789/hooks/agent" },
-    "openclawHookToken": { "label": "OpenClaw Hook Token", "sensitive": true },
-    "hookName": { "label": "Hook Name", "placeholder": "Smartlead" },
-    "hookAgentId": { "label": "Hook Agent ID", "advanced": true },
-    "hookSessionKeyPrefix": { "label": "Session Key Prefix", "advanced": true },
-    "hookWakeMode": { "label": "Wake Mode", "advanced": true },
-    "hookDeliver": { "label": "Deliver Agent Reply", "advanced": true },
-    "hookChannel": { "label": "Delivery Channel" },
-    "hookTo": { "label": "Delivery Target (to)" },
-    "hookModel": { "label": "Model Override", "advanced": true },
-    "hookThinking": { "label": "Thinking Override", "advanced": true },
-    "hookTimeoutSeconds": { "label": "Agent Timeout (s)", "advanced": true },
-    "dedupeTtlSeconds": { "label": "Webhook Dedupe TTL (s)", "advanced": true },
-    "logWebhookPayload": { "label": "Log Raw Webhook Payload", "advanced": true }
+    "hookChannel":          { "label": "Delivery Channel", "help": "Usually set this for reply alerts (for example: slack, telegram, discord). If omitted, OpenClaw uses hooks default channel behavior (`last`)." },
+    "hookAgentId":          { "label": "Hook Agent ID", "advanced": true, "help": "Optional: route webhook work to a specific agent. OpenClaw can also use the default agent." },
+    "webhookSecret":        { "label": "Smartlead Webhook Secret", "sensitive": true, "help": "Optional. Matched against Smartlead payload `secret_key` or secret headers." },
+    "openclawAgentHookUrl": { "label": "OpenClaw /hooks/agent URL", "advanced": true, "help": "Usually auto-derived from OpenClaw `gateway.port` + `hooks.path`.", "placeholder": "http://127.0.0.1:18789/hooks/agent" },
+    "openclawHookToken":    { "label": "OpenClaw Hook Token", "sensitive": true, "advanced": true, "help": "Usually auto-derived from OpenClaw `hooks.token`." },
+    "inboundWebhookPath":   { "label": "Inbound Webhook Path", "advanced": true, "placeholder": "/smartlead/webhook" }
   }
 }

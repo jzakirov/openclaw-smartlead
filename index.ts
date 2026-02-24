@@ -1,42 +1,34 @@
-import { createHash } from "node:crypto";
+// openclaw-smartlead plugin
+// Registers one HTTP route that receives Smartlead webhook events and forwards
+// EMAIL_REPLY events to the openclaw /hooks/agent endpoint.
+// All Smartlead API interaction is done by the agent via the `smartlead` CLI.
+
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 type JsonObject = Record<string, unknown>;
 
 type SmartleadPluginConfig = {
-  apiBaseUrl?: string;
-  apiKey?: string;
-  requestTimeoutMs?: number;
-  inboundWebhookPath?: string;
-  webhookSecret?: string;
-  replyEventTypes?: string[];
+  webhookSecret?: string;          // validate incoming Smartlead webhooks
+  hookChannel?: string;            // delivery channel (e.g. "telegram")
+  hookAgentId?: string;            // optional: route to a specific agent
+  // override-only (auto-derived from api.config by default)
   openclawAgentHookUrl?: string;
   openclawHookToken?: string;
-  hookName?: string;
-  hookAgentId?: string;
-  hookSessionKeyPrefix?: string;
-  hookWakeMode?: "now" | "next-heartbeat";
-  hookDeliver?: boolean;
-  hookChannel?: string;
-  hookTo?: string;
-  hookModel?: string;
-  hookThinking?: string;
-  hookTimeoutSeconds?: number;
-  dedupeTtlSeconds?: number;
-  logWebhookPayload?: boolean;
+  inboundWebhookPath?: string;
 };
 
-const DEFAULT_SMARTLEAD_BASE_URL = "https://server.smartlead.ai/api/v1";
-const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_INBOUND_WEBHOOK_PATH = "/smartlead/webhook";
-const DEFAULT_REPLY_EVENT_TYPES = ["EMAIL_REPLY"];
-const DEFAULT_HOOK_WAKE_MODE = "now";
-const DEFAULT_HOOK_NAME = "Smartlead";
-const DEFAULT_SESSION_KEY_PREFIX = "hook:smartlead:reply:";
-const DEFAULT_DEDUPE_TTL_SECONDS = 15 * 60;
+const REPLY_EVENT_TYPES = ["EMAIL_REPLY"];
+const DEDUPE_TTL_MS = 15 * 60 * 1000;
+const HOOK_FORWARD_TIMEOUT_MS = 10_000;
 const MAX_WEBHOOK_BODY_BYTES = 512 * 1024;
 
+// In-process deduplication: keyed by event fingerprint, value = seen-at ms.
+// Best-effort only — cleared on restart.
 const seenWebhookEvents = new Map<string, number>();
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
 
 function trimString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
@@ -46,85 +38,44 @@ function asRecord(value: unknown): JsonObject {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : {};
 }
 
-function asArray(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function jsonResult(data: unknown) {
-  return {
-    content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-  };
-}
-
 function coerceNumber(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim()) {
-    const parsed = Number(value);
-    if (Number.isFinite(parsed)) return parsed;
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
   }
   return undefined;
 }
 
-function firstNonEmptyString(...values: unknown[]): string {
-  for (const value of values) {
-    const v = trimString(value);
-    if (v) return v;
+function firstNonEmpty(...values: unknown[]): string {
+  for (const v of values) {
+    const s = trimString(v);
+    if (s) return s;
   }
   return "";
 }
 
-function getNested(obj: unknown, path: string[]): unknown {
-  let cur: unknown = obj;
-  for (const key of path) {
-    if (!cur || typeof cur !== "object" || Array.isArray(cur)) return undefined;
-    cur = (cur as JsonObject)[key];
-  }
-  return cur;
-}
-
-function normalizeBaseUrl(value: string): string {
-  const trimmed = value.trim();
-  if (!trimmed) return DEFAULT_SMARTLEAD_BASE_URL;
-  return trimmed.replace(/\/+$/, "");
-}
-
 function normalizePath(path: string): string {
-  const trimmed = path.trim();
-  if (!trimmed) return "/";
-  return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  const t = path.trim();
+  if (!t) return "/";
+  return t.startsWith("/") ? t : `/${t}`;
 }
 
-function normalizeReplyEventTypes(input: unknown): string[] {
-  const arr = Array.isArray(input) ? input : undefined;
-  const values = (arr ?? DEFAULT_REPLY_EVENT_TYPES)
-    .map((v) => trimString(v).toUpperCase())
-    .filter(Boolean);
-  return values.length > 0 ? Array.from(new Set(values)) : [...DEFAULT_REPLY_EVENT_TYPES];
+function sendJson(res: ServerResponse, status: number, data: unknown): void {
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(data));
 }
 
-function pickPluginConfig(api: any): SmartleadPluginConfig {
-  return asRecord(api.pluginConfig ?? {}) as SmartleadPluginConfig;
+function getHeader(req: IncomingMessage, name: string): string {
+  const v = req.headers[name.toLowerCase()];
+  if (Array.isArray(v)) return v[0] ?? "";
+  return typeof v === "string" ? v : "";
 }
 
-function getSmartleadApiKey(cfg: SmartleadPluginConfig): string {
-  return trimString(cfg.apiKey) || trimString(process.env.SMARTLEAD_API_KEY);
-}
+// ─── Config resolution ────────────────────────────────────────────────────────
 
-function getSmartleadBaseUrl(cfg: SmartleadPluginConfig): string {
-  return normalizeBaseUrl(
-    trimString(cfg.apiBaseUrl) || trimString(process.env.SMARTLEAD_API_BASE_URL) || DEFAULT_SMARTLEAD_BASE_URL,
-  );
-}
-
-function getRequestTimeoutMs(cfg: SmartleadPluginConfig): number {
-  const n =
-    coerceNumber(cfg.requestTimeoutMs) ??
-    coerceNumber(process.env.SMARTLEAD_REQUEST_TIMEOUT_MS) ??
-    DEFAULT_REQUEST_TIMEOUT_MS;
-  return Math.max(1_000, Math.min(120_000, n));
-}
-
-function getInboundWebhookPath(cfg: SmartleadPluginConfig): string {
+function resolveWebhookPath(cfg: SmartleadPluginConfig): string {
   return normalizePath(
     trimString(cfg.inboundWebhookPath) ||
       trimString(process.env.SMARTLEAD_WEBHOOK_PATH) ||
@@ -132,143 +83,57 @@ function getInboundWebhookPath(cfg: SmartleadPluginConfig): string {
   );
 }
 
-function getWebhookSecret(cfg: SmartleadPluginConfig): string {
+function resolveWebhookSecret(cfg: SmartleadPluginConfig): string {
   return trimString(cfg.webhookSecret) || trimString(process.env.SMARTLEAD_WEBHOOK_SECRET);
 }
 
-function getOpenClawHookUrl(cfg: SmartleadPluginConfig): string {
-  return trimString(cfg.openclawAgentHookUrl) || trimString(process.env.OPENCLAW_SMARTLEAD_AGENT_HOOK_URL);
+// Tries to derive the hook URL from api.config (same gateway process) when not
+// explicitly configured. This avoids the user having to duplicate port/path.
+function resolveHookUrl(cfg: SmartleadPluginConfig, apiConfig: any): string {
+  const explicit = trimString(cfg.openclawAgentHookUrl) || trimString(process.env.OPENCLAW_SMARTLEAD_AGENT_HOOK_URL);
+  if (explicit) return explicit;
+  const port = coerceNumber(apiConfig?.gateway?.port) ?? 18789;
+  const hooksPath = trimString(apiConfig?.hooks?.path) || "/hooks";
+  return `http://127.0.0.1:${port}${normalizePath(hooksPath)}/agent`;
 }
 
-function getOpenClawHookToken(cfg: SmartleadPluginConfig): string {
-  return trimString(cfg.openclawHookToken) || trimString(process.env.OPENCLAW_HOOKS_TOKEN);
-}
-
-function getDedupeTtlSeconds(cfg: SmartleadPluginConfig): number {
-  const n =
-    coerceNumber(cfg.dedupeTtlSeconds) ??
-    coerceNumber(process.env.SMARTLEAD_DEDUPE_TTL_SECONDS) ??
-    DEFAULT_DEDUPE_TTL_SECONDS;
-  return Math.max(1, Math.min(86400, Math.floor(n)));
-}
-
-function appendQuery(url: URL, query?: unknown) {
-  const obj = asRecord(query);
-  for (const [key, raw] of Object.entries(obj)) {
-    if (raw == null) continue;
-    if (Array.isArray(raw)) {
-      for (const item of raw) url.searchParams.append(key, String(item));
-      continue;
-    }
-    url.searchParams.set(key, String(raw));
-  }
-}
-
-async function smartleadRequest(params: {
-  cfg: SmartleadPluginConfig;
-  method: string;
-  path: string;
-  query?: unknown;
-  body?: unknown;
-  signal?: AbortSignal;
-}) {
-  const apiKey = getSmartleadApiKey(params.cfg);
-  if (!apiKey) {
-    throw new Error("Smartlead API key is required (plugin config apiKey or SMARTLEAD_API_KEY)");
-  }
-
-  const baseUrl = getSmartleadBaseUrl(params.cfg);
-  const path = normalizePath(params.path);
-  const relativePath = path.replace(/^\/+/, "");
-  const url = new URL(relativePath, `${baseUrl}/`);
-  url.searchParams.set("api_key", apiKey);
-  appendQuery(url, params.query);
-
-  const timeoutMs = getRequestTimeoutMs(params.cfg);
-  const signal = params.signal ?? AbortSignal.timeout(timeoutMs);
-  const res = await fetch(url.toString(), {
-    method: params.method.toUpperCase(),
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body:
-      params.body === undefined || params.method.toUpperCase() === "GET"
-        ? undefined
-        : JSON.stringify(params.body),
-    signal,
-  });
-
-  const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
-  let parsed: unknown;
-  if (contentType.includes("application/json")) {
-    try {
-      parsed = await res.json();
-    } catch {
-      parsed = { text: await res.text() };
-    }
-  } else {
-    const text = await res.text();
-    parsed = text ? { text } : { ok: res.ok };
-  }
-
-  if (!res.ok) {
-    throw new Error(
-      `Smartlead HTTP ${res.status}: ${typeof parsed === "string" ? parsed : JSON.stringify(parsed)}`,
-    );
-  }
-
-  return {
-    status: res.status,
-    url: url.toString(),
-    data: parsed,
-  };
-}
-
-async function readRequestBody(req: IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    size += buf.length;
-    if (size > MAX_WEBHOOK_BODY_BYTES) {
-      throw new Error(`Payload too large (${size} bytes)`);
-    }
-    chunks.push(buf);
-  }
-  return Buffer.concat(chunks).toString("utf8");
-}
-
-async function readJsonBody(req: IncomingMessage): Promise<JsonObject> {
-  const raw = await readRequestBody(req);
-  if (!raw.trim()) return {};
-  const parsed = JSON.parse(raw);
-  return asRecord(parsed);
-}
-
-function sendJson(res: ServerResponse, statusCode: number, data: unknown): void {
-  res.statusCode = statusCode;
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.end(JSON.stringify(data));
-}
-
-function getHeader(req: IncomingMessage, name: string): string {
-  const value = req.headers[name.toLowerCase()];
-  if (Array.isArray(value)) return value[0] ?? "";
-  return typeof value === "string" ? value : "";
-}
-
-function extractRequestToken(req: IncomingMessage): string {
-  const host = getHeader(req, "host") || "localhost";
-  const url = new URL(req.url ?? "/", `http://${host}`);
-  const auth = getHeader(req, "authorization");
-  if (/^Bearer\s+/i.test(auth)) return auth.replace(/^Bearer\s+/i, "").trim();
+// Tries to derive the hook token from api.config when not explicitly configured.
+function resolveHookToken(cfg: SmartleadPluginConfig, apiConfig: any): string {
   return (
-    trimString(url.searchParams.get("token")) ||
-    trimString(url.searchParams.get("secret")) ||
-    trimString(getHeader(req, "x-smartlead-secret")) ||
-    trimString(getHeader(req, "x-webhook-secret"))
+    trimString(cfg.openclawHookToken) ||
+    trimString(process.env.OPENCLAW_HOOKS_TOKEN) ||
+    trimString(apiConfig?.hooks?.token)
   );
 }
+
+// ─── Body reading ─────────────────────────────────────────────────────────────
+
+async function readJsonBody(req: IncomingMessage): Promise<JsonObject> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+
+  // 30-second read deadline to prevent slow-client hangs
+  const timeout = setTimeout(() => req.destroy(new Error("body read timeout")), 30_000);
+
+  try {
+    for await (const chunk of req) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+      size += buf.length;
+      if (size > MAX_WEBHOOK_BODY_BYTES) {
+        throw new Error(`Payload too large (limit ${MAX_WEBHOOK_BODY_BYTES} bytes)`);
+      }
+      chunks.push(buf);
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const raw = Buffer.concat(chunks).toString("utf8");
+  if (!raw.trim()) return {};
+  return asRecord(JSON.parse(raw));
+}
+
+// ─── Webhook payload extraction ───────────────────────────────────────────────
 
 type ReplyWebhookContext = {
   eventType: string;
@@ -281,464 +146,237 @@ type ReplyWebhookContext = {
   previewText?: string;
   eventTimestamp?: string;
   statsId?: string;
-  messageId?: string;
   appUrl?: string;
-  description?: string;
   secretKey?: string;
-  leadCorrespondence?: JsonObject;
   payload: JsonObject;
 };
 
-function extractReplyWebhookContext(payload: JsonObject): ReplyWebhookContext {
-  const leadCorrespondence = asRecord(payload.leadCorrespondence);
+function extractReplyContext(payload: JsonObject): ReplyWebhookContext {
+  const lc = asRecord(payload.leadCorrespondence);
   return {
-    eventType: firstNonEmptyString(payload.event_type, payload.eventType, payload.type).toUpperCase(),
+    eventType: firstNonEmpty(payload.event_type, payload.eventType, payload.type).toUpperCase(),
     campaignId: coerceNumber(payload.campaign_id),
     leadId: coerceNumber(payload.sl_email_lead_id) ?? coerceNumber(payload.lead_id),
     leadMapId: coerceNumber(payload.sl_email_lead_map_id) ?? coerceNumber(payload.lead_map_id),
-    leadEmail: firstNonEmptyString(
-      leadCorrespondence.targetLeadEmail,
-      payload.sl_lead_email,
-      payload.email,
-      payload.lead_email,
-    ),
-    responderEmail: firstNonEmptyString(
-      leadCorrespondence.replyReceivedFrom,
-      payload.from_email,
-      payload.reply_from,
-      payload.to_email,
-    ),
-    subject: firstNonEmptyString(payload.subject),
-    previewText: firstNonEmptyString(payload.preview_text, payload.preview, payload.snippet),
-    eventTimestamp: firstNonEmptyString(payload.event_timestamp, payload.time_replied, payload.timestamp),
-    statsId: firstNonEmptyString(payload.stats_id),
-    messageId: firstNonEmptyString(payload.message_id),
-    appUrl: firstNonEmptyString(payload.app_url, payload.ui_master_inbox_link),
-    description: firstNonEmptyString(payload.description),
-    secretKey: firstNonEmptyString(payload.secret_key),
-    leadCorrespondence: Object.keys(leadCorrespondence).length > 0 ? leadCorrespondence : undefined,
+    leadEmail: firstNonEmpty(lc.targetLeadEmail, payload.sl_lead_email, payload.email, payload.lead_email),
+    responderEmail: firstNonEmpty(lc.replyReceivedFrom, payload.from_email, payload.reply_from),
+    subject: firstNonEmpty(payload.subject),
+    previewText: firstNonEmpty(payload.preview_text, payload.preview),
+    eventTimestamp: firstNonEmpty(payload.event_timestamp, payload.time_replied, payload.timestamp),
+    statsId: firstNonEmpty(payload.stats_id),
+    appUrl: firstNonEmpty(payload.app_url, payload.ui_master_inbox_link),
+    secretKey: firstNonEmpty(payload.secret_key),
     payload,
   };
 }
 
-function makeWebhookEventKey(ctx: ReplyWebhookContext): string {
+// ─── Deduplication ────────────────────────────────────────────────────────────
+
+function makeEventKey(ctx: ReplyWebhookContext): string {
   const base =
     ctx.statsId ||
-    ctx.messageId ||
-    [
-      ctx.eventType,
-      ctx.campaignId ?? "",
-      ctx.leadId ?? "",
-      ctx.leadEmail ?? "",
-      ctx.eventTimestamp ?? "",
-    ].join("|");
+    [ctx.eventType, ctx.campaignId ?? "", ctx.leadId ?? "", ctx.leadEmail ?? "", ctx.eventTimestamp ?? ""].join("|");
   return createHash("sha256").update(base).digest("hex");
 }
 
-function pruneSeenWebhookEvents(ttlSeconds: number) {
-  const cutoff = Date.now() - ttlSeconds * 1000;
+function pruneExpiredKeys(): void {
+  const cutoff = Date.now() - DEDUPE_TTL_MS;
   for (const [key, seenAt] of seenWebhookEvents) {
     if (seenAt < cutoff) seenWebhookEvents.delete(key);
   }
 }
 
-function sanitizeSessionKeyPart(input: string): string {
-  return input.replace(/[^a-zA-Z0-9:_-]+/g, "-").slice(0, 80);
-}
+// ─── Agent prompt ─────────────────────────────────────────────────────────────
 
-function buildHookSessionKey(cfg: SmartleadPluginConfig, ctx: ReplyWebhookContext): string {
-  const prefix = trimString(cfg.hookSessionKeyPrefix) || DEFAULT_SESSION_KEY_PREFIX;
-  const sourcePart = sanitizeSessionKeyPart(ctx.statsId || ctx.messageId || makeWebhookEventKey(ctx).slice(0, 16));
-  return `${prefix}${sourcePart}`;
-}
+function buildPrompt(ctx: ReplyWebhookContext): string {
+  const lines: string[] = [
+    "A Smartlead EMAIL_REPLY webhook has arrived. Do the following:",
+    "",
+    '1. Send a notification message starting with exactly "New lead answer" to the configured channel.',
+    "   Include: lead email, campaign ID, and a one-line reply preview if available.",
+    "2. Fetch the full email conversation history using the smartlead CLI:",
+  ];
 
-function buildSmartleadReplyPrompt(ctx: ReplyWebhookContext): string {
-  const lines: string[] = [];
+  if (ctx.campaignId != null && ctx.leadId != null) {
+    lines.push(
+      `   smartlead campaigns leads message-history ${ctx.campaignId} ${ctx.leadId}`,
+    );
+  } else if (ctx.leadEmail) {
+    lines.push(
+      `   # lead_id is missing — resolve it first:`,
+      `   smartlead leads get-by-email --email "${ctx.leadEmail}"`,
+      `   # then fetch history:`,
+      `   smartlead campaigns leads message-history ${ctx.campaignId ?? "<campaign_id>"} <resolved_lead_id>`,
+    );
+  } else {
+    lines.push(
+      `   # Both lead_id and email are missing. Try:`,
+      `   smartlead campaigns leads list ${ctx.campaignId ?? "<campaign_id>"}`,
+    );
+  }
+
   lines.push(
-    "Smartlead EMAIL_REPLY webhook received. Send a short user-facing alert to the configured channel.",
+    "3. Summarize the conversation thread (bullets or short paragraph) and append it to your channel message.",
+    "",
+    "── Webhook context ──────────────────────────────────────────",
   );
-  lines.push('Start the message with exactly: "New lead answer"');
-  lines.push(
-    "Then summarize the prior conversation with this lead (concise bullets or short paragraph).",
-  );
-  lines.push(
-    "If campaign_id and lead_id are available, call smartlead_get_campaign_lead_message_history first.",
-  );
-  lines.push(
-    "If lead_id is missing but email is available, call smartlead_get_lead_by_email to resolve the lead, then continue.",
-  );
-  lines.push("Prefer leadCorrespondence.targetLeadEmail as the original target lead.");
-  lines.push("");
-  lines.push("Resolved fields:");
-  if (ctx.campaignId != null) lines.push(`- campaign_id: ${ctx.campaignId}`);
-  if (ctx.leadId != null) lines.push(`- lead_id: ${ctx.leadId}`);
-  if (ctx.leadMapId != null) lines.push(`- lead_map_id: ${ctx.leadMapId}`);
-  if (ctx.leadEmail) lines.push(`- lead_email: ${ctx.leadEmail}`);
-  if (ctx.responderEmail) lines.push(`- responder_email: ${ctx.responderEmail}`);
-  if (ctx.subject) lines.push(`- subject: ${ctx.subject}`);
-  if (ctx.previewText) lines.push(`- preview_text: ${ctx.previewText}`);
-  if (ctx.appUrl) lines.push(`- smartlead_app_url: ${ctx.appUrl}`);
-  if (ctx.eventTimestamp) lines.push(`- event_timestamp: ${ctx.eventTimestamp}`);
-  lines.push("");
-  lines.push("Webhook payload JSON:");
-  lines.push("```json");
-  lines.push(JSON.stringify(ctx.payload, null, 2));
-  lines.push("```");
+  if (ctx.campaignId != null) lines.push(`campaign_id:       ${ctx.campaignId}`);
+  if (ctx.leadId != null)     lines.push(`lead_id:           ${ctx.leadId}`);
+  if (ctx.leadMapId != null)  lines.push(`lead_map_id:       ${ctx.leadMapId}`);
+  if (ctx.leadEmail)          lines.push(`lead_email:        ${ctx.leadEmail}`);
+  if (ctx.responderEmail)     lines.push(`responder_email:   ${ctx.responderEmail}`);
+  if (ctx.subject)            lines.push(`subject:           ${ctx.subject}`);
+  if (ctx.previewText)        lines.push(`preview:           ${ctx.previewText}`);
+  if (ctx.eventTimestamp)     lines.push(`timestamp:         ${ctx.eventTimestamp}`);
+  if (ctx.appUrl)             lines.push(`smartlead_url:     ${ctx.appUrl}`);
+
   return lines.join("\n");
 }
 
-async function forwardToOpenClawAgentHook(params: {
+// ─── openclaw /hooks/agent forward ────────────────────────────────────────────
+
+async function forwardToHookAgent(params: {
   cfg: SmartleadPluginConfig;
-  replyCtx: ReplyWebhookContext;
-  signal?: AbortSignal;
-}) {
-  const { cfg, replyCtx } = params;
-  const url = getOpenClawHookUrl(cfg);
-  const token = getOpenClawHookToken(cfg);
-  if (!url) {
-    throw new Error("openclawAgentHookUrl is required for webhook forwarding");
-  }
+  apiConfig: any;
+  ctx: ReplyWebhookContext;
+  logger: any;
+}): Promise<void> {
+  const { cfg, apiConfig, ctx, logger } = params;
+
+  const url = resolveHookUrl(cfg, apiConfig);
+  const token = resolveHookToken(cfg, apiConfig);
+
   if (!token) {
-    throw new Error("openclawHookToken (or OPENCLAW_HOOKS_TOKEN) is required for webhook forwarding");
+    logger.error?.("[smartlead] hooks token not configured — set openclawHookToken, OPENCLAW_HOOKS_TOKEN, or hooks.token in openclaw config");
+    return;
   }
 
   const body: JsonObject = {
-    message: buildSmartleadReplyPrompt(replyCtx),
-    name: trimString(cfg.hookName) || DEFAULT_HOOK_NAME,
-    sessionKey: buildHookSessionKey(cfg, replyCtx),
-    wakeMode: trimString(cfg.hookWakeMode) || DEFAULT_HOOK_WAKE_MODE,
-    deliver: cfg.hookDeliver ?? true,
+    message: buildPrompt(ctx),
+    name: "Smartlead",
+    wakeMode: "now",
+    deliver: true,
   };
 
-  const agentId = trimString(cfg.hookAgentId);
   const channel = trimString(cfg.hookChannel);
-  const to = trimString(cfg.hookTo);
-  const model = trimString(cfg.hookModel);
-  const thinking = trimString(cfg.hookThinking);
-  const timeoutSeconds = coerceNumber(cfg.hookTimeoutSeconds);
-
-  if (agentId) body.agentId = agentId;
+  const agentId = trimString(cfg.hookAgentId);
   if (channel) body.channel = channel;
-  if (to) body.to = to;
-  if (model) body.model = model;
-  if (thinking) body.thinking = thinking;
-  if (timeoutSeconds && timeoutSeconds > 0) body.timeoutSeconds = Math.floor(timeoutSeconds);
+  if (agentId) body.agentId = agentId;
 
-  const timeoutMs = getRequestTimeoutMs(cfg);
-  const signal = params.signal ?? AbortSignal.timeout(timeoutMs);
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-    signal,
-  });
-
-  const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
-  const responseData = contentType.includes("application/json") ? await res.json().catch(() => ({})) : await res.text();
-  if (!res.ok) {
-    throw new Error(`OpenClaw hook HTTP ${res.status}: ${JSON.stringify(responseData)}`);
+  try {
+    const signal = AbortSignal.timeout(HOOK_FORWARD_TIMEOUT_MS);
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      logger.error?.(`[smartlead] /hooks/agent returned ${res.status}: ${text}`);
+    }
+  } catch (err) {
+    logger.error?.(`[smartlead] /hooks/agent call failed: ${String(err)}`);
   }
-
-  return { status: res.status, data: responseData, request: body };
 }
 
-function registerSmartleadTools(api: any, cfg: SmartleadPluginConfig) {
-  api.registerTool({
-    name: "smartlead_list_campaigns",
-    description: "List Smartlead campaigns. Use before choosing a campaign_id for lead/webhook operations.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        query: {
-          type: "object",
-          description: "Optional query params (e.g. client_id, offset, limit).",
-          additionalProperties: true,
-        },
-      },
-      required: [],
-    },
-    async execute(_id: string, params: any, signal: AbortSignal) {
-      const result = await smartleadRequest({
-        cfg,
-        method: "GET",
-        path: "/campaigns",
-        query: params?.query,
-        signal,
-      });
-      return jsonResult(result);
-    },
-  });
+// ─── Webhook route ────────────────────────────────────────────────────────────
 
-  api.registerTool({
-    name: "smartlead_get_lead_by_email",
-    description:
-      "Look up a Smartlead lead globally by email. Useful when a webhook has an email address but you still need IDs.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        email: { type: "string" },
-      },
-      required: ["email"],
-    },
-    async execute(_id: string, params: any, signal: AbortSignal) {
-      const email = trimString(params?.email);
-      if (!email) throw new Error("email is required");
-      const result = await smartleadRequest({
-        cfg,
-        method: "GET",
-        path: "/leads",
-        query: { email },
-        signal,
-      });
-      return jsonResult(result);
-    },
-  });
-
-  api.registerTool({
-    name: "smartlead_get_campaign_lead_message_history",
-    description:
-      "Fetch prior email conversation/message history for a lead in a Smartlead campaign. Use this to summarize prior exchanges.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        campaign_id: { type: "number" },
-        lead_id: { type: "number" },
-      },
-      required: ["campaign_id", "lead_id"],
-    },
-    async execute(_id: string, params: any, signal: AbortSignal) {
-      const campaignId = coerceNumber(params?.campaign_id);
-      const leadId = coerceNumber(params?.lead_id);
-      if (campaignId == null || leadId == null) throw new Error("campaign_id and lead_id are required");
-      const result = await smartleadRequest({
-        cfg,
-        method: "GET",
-        path: `/campaigns/${campaignId}/leads/${leadId}/message-history`,
-        signal,
-      });
-      return jsonResult(result);
-    },
-  });
-
-  api.registerTool({
-    name: "smartlead_list_campaign_webhooks",
-    description: "List Smartlead webhooks configured for a campaign.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        campaign_id: { type: "number" },
-      },
-      required: ["campaign_id"],
-    },
-    async execute(_id: string, params: any, signal: AbortSignal) {
-      const campaignId = coerceNumber(params?.campaign_id);
-      if (campaignId == null) throw new Error("campaign_id is required");
-      const result = await smartleadRequest({
-        cfg,
-        method: "GET",
-        path: `/campaigns/${campaignId}/webhooks`,
-        signal,
-      });
-      return jsonResult(result);
-    },
-  });
-
-  api.registerTool({
-    name: "smartlead_upsert_campaign_webhook",
-    description:
-      "Add or update a Smartlead campaign webhook. Request body usually includes id (or null), name, webhook_url, event_types, categories.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        campaign_id: { type: "number" },
-        body: {
-          type: "object",
-          additionalProperties: true,
-        },
-      },
-      required: ["campaign_id", "body"],
-    },
-    async execute(_id: string, params: any, signal: AbortSignal) {
-      const campaignId = coerceNumber(params?.campaign_id);
-      if (campaignId == null) throw new Error("campaign_id is required");
-      const body = asRecord(params?.body);
-      const result = await smartleadRequest({
-        cfg,
-        method: "POST",
-        path: `/campaigns/${campaignId}/webhooks`,
-        body,
-        signal,
-      });
-      return jsonResult(result);
-    },
-  });
-
-  api.registerTool({
-    name: "smartlead_delete_campaign_webhook",
-    description: "Delete a Smartlead campaign webhook using webhook_id query param.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        campaign_id: { type: "number" },
-        webhook_id: { type: "number" },
-      },
-      required: ["campaign_id", "webhook_id"],
-    },
-    async execute(_id: string, params: any, signal: AbortSignal) {
-      const campaignId = coerceNumber(params?.campaign_id);
-      const webhookId = coerceNumber(params?.webhook_id);
-      if (campaignId == null || webhookId == null) throw new Error("campaign_id and webhook_id are required");
-      const result = await smartleadRequest({
-        cfg,
-        method: "DELETE",
-        path: `/campaigns/${campaignId}/webhooks`,
-        query: { webhook_id: webhookId },
-        signal,
-      });
-      return jsonResult(result);
-    },
-  });
-
-  api.registerTool({
-    name: "smartlead_raw_request",
-    description:
-      "Raw Smartlead API request fallback. Use for endpoints not covered by specific tools. Path is relative to /api/v1.",
-    parameters: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        method: { type: "string" },
-        path: { type: "string" },
-        query: { type: "object", additionalProperties: true },
-        body: {
-          description: "Optional JSON request body",
-          anyOf: [
-            { type: "object", additionalProperties: true },
-            { type: "array" },
-            { type: "string" },
-            { type: "number" },
-            { type: "boolean" },
-            { type: "null" },
-          ],
-        },
-      },
-      required: ["method", "path"],
-    },
-    async execute(_id: string, params: any, signal: AbortSignal) {
-      const method = trimString(params?.method || "GET").toUpperCase();
-      const path = trimString(params?.path);
-      if (!path) throw new Error("path is required");
-      const result = await smartleadRequest({
-        cfg,
-        method,
-        path,
-        query: params?.query,
-        body: params?.body,
-        signal,
-      });
-      return jsonResult(result);
-    },
-  });
-}
-
-function registerSmartleadWebhookRoute(api: any, cfg: SmartleadPluginConfig) {
-  const path = getInboundWebhookPath(cfg);
-  const replyEventTypes = normalizeReplyEventTypes(cfg.replyEventTypes);
-  const logRawPayload = cfg.logWebhookPayload === true;
+export default function registerSmartleadPlugin(api: any) {
+  const cfg = asRecord(api.pluginConfig ?? {}) as SmartleadPluginConfig;
+  const webhookPath = resolveWebhookPath(cfg);
+  const expectedSecret = resolveWebhookSecret(cfg);
 
   api.registerHttpRoute({
-    path,
+    path: webhookPath,
     handler: async (req: IncomingMessage, res: ServerResponse) => {
-      if ((req.method ?? "").toUpperCase() === "GET") {
-        sendJson(res, 200, {
-          ok: true,
-          plugin: "smartlead",
-          webhookPath: path,
-          note: "POST Smartlead webhook payloads here.",
-        });
+      const method = (req.method ?? "").toUpperCase();
+
+      // GET → health / discovery probe
+      if (method === "GET") {
+        sendJson(res, 200, { ok: true, plugin: "smartlead", webhookPath, replyEventTypes: REPLY_EVENT_TYPES });
         return;
       }
 
-      if ((req.method ?? "").toUpperCase() !== "POST") {
+      if (method !== "POST") {
         sendJson(res, 405, { error: "method_not_allowed", allowed: ["GET", "POST"] });
         return;
       }
 
+      // Read body
       let payload: JsonObject;
       try {
         payload = await readJsonBody(req);
       } catch (err) {
-        sendJson(res, 400, { error: "invalid_json", message: String(err) });
+        sendJson(res, 400, { error: "invalid_body", message: String(err) });
         return;
       }
 
-      const ctx = extractReplyWebhookContext(payload);
-      const expectedSecret = getWebhookSecret(cfg);
-      const providedToken = extractRequestToken(req);
-      const providedSecret = firstNonEmptyString(providedToken, ctx.secretKey);
-      if (expectedSecret && providedSecret !== expectedSecret) {
-        sendJson(res, 401, { error: "invalid_webhook_secret" });
-        return;
+      const ctx = extractReplyContext(payload);
+
+      // Validate webhook secret (timing-safe comparison)
+      if (expectedSecret) {
+        const headerToken = (() => {
+          const auth = getHeader(req, "authorization");
+          if (/^Bearer\s+/i.test(auth)) return auth.replace(/^Bearer\s+/i, "").trim();
+          return getHeader(req, "x-smartlead-secret") || getHeader(req, "x-webhook-secret");
+        })();
+        // Accept Smartlead's native secret_key payload field as fallback
+        const provided = headerToken || ctx.secretKey;
+        if (!provided) {
+          sendJson(res, 401, { error: "missing_webhook_secret" });
+          return;
+        }
+        try {
+          const a = Buffer.from(provided);
+          const b = Buffer.from(expectedSecret);
+          // timingSafeEqual requires same-length buffers
+          if (a.length !== b.length || !timingSafeEqual(a, b)) {
+            sendJson(res, 401, { error: "invalid_webhook_secret" });
+            return;
+          }
+        } catch {
+          sendJson(res, 401, { error: "invalid_webhook_secret" });
+          return;
+        }
       }
 
-      if (logRawPayload) {
-        api.logger.info?.(`[smartlead] webhook payload: ${JSON.stringify(payload)}`);
-      }
-
+      // Event type filter
       const isReplyEvent =
-        (ctx.eventType && replyEventTypes.includes(ctx.eventType)) ||
-        (!ctx.eventType && Boolean(ctx.previewText || ctx.leadCorrespondence || payload.time_replied));
+        (ctx.eventType && REPLY_EVENT_TYPES.includes(ctx.eventType)) ||
+        // Fallback heuristic only when event_type is completely absent
+        (!ctx.eventType && (!!ctx.leadId || !!ctx.statsId));
 
       if (!isReplyEvent) {
         sendJson(res, 202, {
           ok: true,
           ignored: true,
-          reason: "unsupported_event_type",
           event_type: ctx.eventType || null,
-          supported_event_types: replyEventTypes,
+          supported: REPLY_EVENT_TYPES,
         });
         return;
       }
 
-      const dedupeTtlSeconds = getDedupeTtlSeconds(cfg);
-      pruneSeenWebhookEvents(dedupeTtlSeconds);
-      const dedupeKey = makeWebhookEventKey(ctx);
-      if (seenWebhookEvents.has(dedupeKey)) {
-        sendJson(res, 200, { ok: true, duplicate: true, event_key: dedupeKey });
+      // In-process deduplication (best-effort, cleared on restart)
+      pruneExpiredKeys();
+      const eventKey = makeEventKey(ctx);
+      if (seenWebhookEvents.has(eventKey)) {
+        sendJson(res, 200, { ok: true, duplicate: true });
         return;
       }
-      seenWebhookEvents.set(dedupeKey, Date.now());
+      seenWebhookEvents.set(eventKey, Date.now());
 
-      try {
-        const forwarded = await forwardToOpenClawAgentHook({ cfg, replyCtx: ctx });
-        sendJson(res, 202, {
-          ok: true,
-          forwarded: true,
-          event_type: ctx.eventType || "EMAIL_REPLY",
-          campaign_id: ctx.campaignId ?? null,
-          lead_id: ctx.leadId ?? null,
-          lead_email: ctx.leadEmail ?? null,
-          openclaw_status: forwarded.status,
-        });
-      } catch (err) {
-        api.logger.error?.(`[smartlead] webhook forward failed: ${String(err)}`);
-        sendJson(res, 500, { error: "hook_forward_failed", message: String(err) });
-      }
+      // Respond to Smartlead immediately, then forward async.
+      // This prevents Smartlead retries if openclaw is slow or misconfigured.
+      sendJson(res, 202, {
+        ok: true,
+        event_type: ctx.eventType || "EMAIL_REPLY",
+        campaign_id: ctx.campaignId ?? null,
+        lead_id: ctx.leadId ?? null,
+        lead_email: ctx.leadEmail ?? null,
+      });
+
+      void forwardToHookAgent({ cfg, apiConfig: api.config, ctx, logger: api.logger });
     },
   });
-}
-
-export default function registerSmartleadPlugin(api: any) {
-  const cfg = pickPluginConfig(api);
-  registerSmartleadTools(api, cfg);
-  registerSmartleadWebhookRoute(api, cfg);
 }

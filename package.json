@@ -1,8 +1,8 @@
 {
   "name": "@jzakirov/smartlead",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Smartlead API + webhook reply forwarding plugin for OpenClaw",
+  "description": "Smartlead plugin for OpenClaw. Adds webhook relay and skills for interacting with the Smartlead API.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -20,6 +20,7 @@
     "index.ts",
     "openclaw.plugin.json",
     "skills",
+    "setup.sh",
     "README.md",
     "LICENSE"
   ],
