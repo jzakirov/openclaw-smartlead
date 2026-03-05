@@ -1,6 +1,6 @@
 ---
 name: smartlead
-description: "Manage Smartlead campaigns, leads, and webhooks from the command line via the smartlead CLI."
+description: "Smartlead email outreach CLI — campaigns, leads, webhooks, message history. Use when managing outreach campaigns or processing lead replies."
 metadata:
   {
     "openclaw":
