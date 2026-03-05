@@ -1,7 +1,7 @@
 // openclaw-smartlead plugin
 // Registers one HTTP route that receives Smartlead webhook events and forwards
-// EMAIL_REPLY events to the openclaw /hooks/agent endpoint.
-// All Smartlead API interaction is done by the agent via the `smartlead` CLI.
+// EMAIL_REPLY events to the OpenClaw mapped hook endpoint (/hooks/smartlead by default).
+// The plugin stays transport-focused: validate -> parse -> dedupe -> forward.
 
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -10,15 +10,14 @@ type JsonObject = Record<string, unknown>;
 
 type SmartleadPluginConfig = {
   webhookSecret?: string;          // validate incoming Smartlead webhooks
-  hookChannel?: string;            // delivery channel (e.g. "telegram")
-  hookAgentId?: string;            // optional: route to a specific agent
   // override-only (auto-derived from api.config by default)
-  openclawAgentHookUrl?: string;
+  openclawHookUrl?: string;        // defaults to /hooks/smartlead on local gateway
   openclawHookToken?: string;
   inboundWebhookPath?: string;
 };
 
 const DEFAULT_INBOUND_WEBHOOK_PATH = "/smartlead/webhook";
+const DEFAULT_OPENCLAW_MAPPED_HOOK_NAME = "smartlead";
 const REPLY_EVENT_TYPES = ["EMAIL_REPLY"];
 const DEDUPE_TTL_MS = 15 * 60 * 1000;
 const HOOK_FORWARD_TIMEOUT_MS = 10_000;
@@ -87,14 +86,17 @@ function resolveWebhookSecret(cfg: SmartleadPluginConfig): string {
   return trimString(cfg.webhookSecret) || trimString(process.env.SMARTLEAD_WEBHOOK_SECRET);
 }
 
-// Tries to derive the hook URL from api.config (same gateway process) when not
-// explicitly configured. This avoids the user having to duplicate port/path.
+// Tries to derive the mapped hook URL from api.config (same gateway process)
+// when not explicitly configured. This avoids duplicating port/path.
 function resolveHookUrl(cfg: SmartleadPluginConfig, apiConfig: any): string {
-  const explicit = trimString(cfg.openclawAgentHookUrl) || trimString(process.env.OPENCLAW_SMARTLEAD_AGENT_HOOK_URL);
+  const explicit =
+    trimString(cfg.openclawHookUrl) ||
+    trimString(process.env.OPENCLAW_SMARTLEAD_HOOK_URL) ||
+    trimString(process.env.OPENCLAW_SMARTLEAD_AGENT_HOOK_URL); // legacy env fallback
   if (explicit) return explicit;
   const port = coerceNumber(apiConfig?.gateway?.port) ?? 18789;
   const hooksPath = trimString(apiConfig?.hooks?.path) || "/hooks";
-  return `http://127.0.0.1:${port}${normalizePath(hooksPath)}/agent`;
+  return `http://127.0.0.1:${port}${normalizePath(hooksPath)}/${DEFAULT_OPENCLAW_MAPPED_HOOK_NAME}`;
 }
 
 // Tries to derive the hook token from api.config when not explicitly configured.
@@ -138,13 +140,21 @@ async function readJsonBody(req: IncomingMessage): Promise<JsonObject> {
 type ReplyWebhookContext = {
   eventType: string;
   campaignId?: number;
+  campaignName?: string;
+  campaignStatus?: string;
   leadId?: number;
   leadMapId?: number;
   leadEmail?: string;
   responderEmail?: string;
+  responderName?: string;
+  targetName?: string;
+  replyCategory?: string;
+  repliedCompanyDomain?: string;
   subject?: string;
   previewText?: string;
   eventTimestamp?: string;
+  messageId?: string;
+  sequenceNumber?: number;
   statsId?: string;
   appUrl?: string;
   secretKey?: string;
@@ -153,16 +163,25 @@ type ReplyWebhookContext = {
 
 function extractReplyContext(payload: JsonObject): ReplyWebhookContext {
   const lc = asRecord(payload.leadCorrespondence);
+  const leadCategory = asRecord(payload.lead_category);
   return {
     eventType: firstNonEmpty(payload.event_type, payload.eventType, payload.type).toUpperCase(),
     campaignId: coerceNumber(payload.campaign_id),
+    campaignName: firstNonEmpty(payload.campaign_name),
+    campaignStatus: firstNonEmpty(payload.campaign_status),
     leadId: coerceNumber(payload.sl_email_lead_id) ?? coerceNumber(payload.lead_id),
     leadMapId: coerceNumber(payload.sl_email_lead_map_id) ?? coerceNumber(payload.lead_map_id),
     leadEmail: firstNonEmpty(lc.targetLeadEmail, payload.sl_lead_email, payload.email, payload.lead_email),
     responderEmail: firstNonEmpty(lc.replyReceivedFrom, payload.from_email, payload.reply_from),
+    responderName: firstNonEmpty(payload.from_name, lc.replyReceivedFromName),
+    targetName: firstNonEmpty(payload.to_name, lc.targetLeadName),
+    replyCategory: firstNonEmpty(payload.reply_category, payload.category, leadCategory.new_name, leadCategory.name),
+    repliedCompanyDomain: firstNonEmpty(lc.repliedCompanyDomain),
     subject: firstNonEmpty(payload.subject),
     previewText: firstNonEmpty(payload.preview_text, payload.preview),
     eventTimestamp: firstNonEmpty(payload.event_timestamp, payload.time_replied, payload.timestamp),
+    messageId: firstNonEmpty(payload.message_id),
+    sequenceNumber: coerceNumber(payload.sequence_number),
     statsId: firstNonEmpty(payload.stats_id),
     appUrl: firstNonEmpty(payload.app_url, payload.ui_master_inbox_link),
     secretKey: firstNonEmpty(payload.secret_key),
@@ -186,54 +205,99 @@ function pruneExpiredKeys(): void {
   }
 }
 
-// ─── Agent prompt ─────────────────────────────────────────────────────────────
+// ─── Forward payload shaping ──────────────────────────────────────────────────
 
-function buildPrompt(ctx: ReplyWebhookContext): string {
-  const lines: string[] = [
-    "A Smartlead EMAIL_REPLY webhook has arrived. Do the following:",
-    "",
-    '1. Send a notification message starting with exactly "New lead answer" to the configured channel.',
-    "   Include: lead email, campaign ID, and a one-line reply preview if available.",
-    "2. Fetch the full email conversation history using the smartlead CLI:",
-  ];
-
-  if (ctx.campaignId != null && ctx.leadId != null) {
-    lines.push(
-      `   smartlead campaigns leads message-history ${ctx.campaignId} ${ctx.leadId}`,
-    );
-  } else if (ctx.leadEmail) {
-    lines.push(
-      `   # lead_id is missing — resolve it first:`,
-      `   smartlead leads get-by-email --email "${ctx.leadEmail}"`,
-      `   # then fetch history:`,
-      `   smartlead campaigns leads message-history ${ctx.campaignId ?? "<campaign_id>"} <resolved_lead_id>`,
-    );
-  } else {
-    lines.push(
-      `   # Both lead_id and email are missing. Try:`,
-      `   smartlead campaigns leads list ${ctx.campaignId ?? "<campaign_id>"}`,
-    );
+function sanitizeForForward(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeForForward);
+  if (!value || typeof value !== "object") return value;
+  const input = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(input)) {
+    if (k === "secret_key" || k === "secretKey") {
+      out[k] = "[redacted]";
+      continue;
+    }
+    out[k] = sanitizeForForward(v);
   }
-
-  lines.push(
-    "3. Summarize the conversation thread (bullets or short paragraph) and append it to your channel message.",
-    "",
-    "── Webhook context ──────────────────────────────────────────",
-  );
-  if (ctx.campaignId != null) lines.push(`campaign_id:       ${ctx.campaignId}`);
-  if (ctx.leadId != null)     lines.push(`lead_id:           ${ctx.leadId}`);
-  if (ctx.leadMapId != null)  lines.push(`lead_map_id:       ${ctx.leadMapId}`);
-  if (ctx.leadEmail)          lines.push(`lead_email:        ${ctx.leadEmail}`);
-  if (ctx.responderEmail)     lines.push(`responder_email:   ${ctx.responderEmail}`);
-  if (ctx.subject)            lines.push(`subject:           ${ctx.subject}`);
-  if (ctx.previewText)        lines.push(`preview:           ${ctx.previewText}`);
-  if (ctx.eventTimestamp)     lines.push(`timestamp:         ${ctx.eventTimestamp}`);
-  if (ctx.appUrl)             lines.push(`smartlead_url:     ${ctx.appUrl}`);
-
-  return lines.join("\n");
+  return out;
 }
 
-// ─── openclaw /hooks/agent forward ────────────────────────────────────────────
+function buildPayloadSummary(ctx: ReplyWebhookContext): JsonObject {
+  const leadCorrespondence = asRecord(ctx.payload.leadCorrespondence);
+  return {
+    topLevelKeys: Object.keys(ctx.payload).sort(),
+    leadCorrespondenceKeys: Object.keys(leadCorrespondence).sort(),
+    hasLeadCorrespondence: Object.keys(leadCorrespondence).length > 0,
+    hasReplyCategory: Boolean(ctx.replyCategory),
+    hasMessageId: Boolean(ctx.messageId),
+    hasLeadId: ctx.leadId != null,
+    hasLeadEmail: Boolean(ctx.leadEmail),
+  };
+}
+
+function buildForwardPayload(params: {
+  ctx: ReplyWebhookContext;
+  eventKey: string;
+  webhookPath: string;
+}): JsonObject {
+  const { ctx, eventKey, webhookPath } = params;
+  return {
+    source: "smartlead",
+    plugin: "smartlead",
+    kind: "smartlead.webhook",
+    eventType: ctx.eventType || null,
+    event_type: ctx.eventType || null,
+    webhookPath,
+    receivedAt: new Date().toISOString(),
+    dedupeKey: eventKey,
+
+    // Flat aliases for easy hook mapping templates
+    campaign_id: ctx.campaignId ?? null,
+    campaign_name: ctx.campaignName ?? null,
+    campaign_status: ctx.campaignStatus ?? null,
+    lead_id: ctx.leadId ?? null,
+    lead_map_id: ctx.leadMapId ?? null,
+    lead_email: ctx.leadEmail ?? null,
+    responder_email: ctx.responderEmail ?? null,
+    responder_name: ctx.responderName ?? null,
+    target_name: ctx.targetName ?? null,
+    reply_category: ctx.replyCategory ?? null,
+    replied_company_domain: ctx.repliedCompanyDomain ?? null,
+    subject: ctx.subject ?? null,
+    preview_text: ctx.previewText ?? null,
+    event_timestamp: ctx.eventTimestamp ?? null,
+    message_id: ctx.messageId ?? null,
+    sequence_number: ctx.sequenceNumber ?? null,
+    stats_id: ctx.statsId ?? null,
+    app_url: ctx.appUrl ?? null,
+
+    context: {
+      campaignId: ctx.campaignId ?? null,
+      campaignName: ctx.campaignName ?? null,
+      campaignStatus: ctx.campaignStatus ?? null,
+      leadId: ctx.leadId ?? null,
+      leadMapId: ctx.leadMapId ?? null,
+      leadEmail: ctx.leadEmail ?? null,
+      responderEmail: ctx.responderEmail ?? null,
+      responderName: ctx.responderName ?? null,
+      targetName: ctx.targetName ?? null,
+      replyCategory: ctx.replyCategory ?? null,
+      repliedCompanyDomain: ctx.repliedCompanyDomain ?? null,
+      subject: ctx.subject ?? null,
+      previewText: ctx.previewText ?? null,
+      eventTimestamp: ctx.eventTimestamp ?? null,
+      messageId: ctx.messageId ?? null,
+      sequenceNumber: ctx.sequenceNumber ?? null,
+      statsId: ctx.statsId ?? null,
+      appUrl: ctx.appUrl ?? null,
+    },
+
+    payloadSummary: buildPayloadSummary(ctx),
+    payload: sanitizeForForward(ctx.payload),
+  };
+}
+
+// ─── openclaw mapped hook forward ─────────────────────────────────────────────
 
 async function forwardToHookAgent(params: {
   cfg: SmartleadPluginConfig;
@@ -251,32 +315,20 @@ async function forwardToHookAgent(params: {
     return;
   }
 
-  const body: JsonObject = {
-    message: buildPrompt(ctx),
-    name: "Smartlead",
-    wakeMode: "now",
-    deliver: true,
-  };
-
-  const channel = trimString(cfg.hookChannel);
-  const agentId = trimString(cfg.hookAgentId);
-  if (channel) body.channel = channel;
-  if (agentId) body.agentId = agentId;
-
   try {
     const signal = AbortSignal.timeout(HOOK_FORWARD_TIMEOUT_MS);
     const res = await fetch(url, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(ctx.payload),
       signal,
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      logger.error?.(`[smartlead] /hooks/agent returned ${res.status}: ${text}`);
+      logger.error?.(`[smartlead] mapped hook returned ${res.status} from ${url}: ${text}`);
     }
   } catch (err) {
-    logger.error?.(`[smartlead] /hooks/agent call failed: ${String(err)}`);
+    logger.error?.(`[smartlead] mapped hook call failed (${url}): ${String(err)}`);
   }
 }
 
@@ -294,7 +346,14 @@ export default function registerSmartleadPlugin(api: any) {
 
       // GET → health / discovery probe
       if (method === "GET") {
-        sendJson(res, 200, { ok: true, plugin: "smartlead", webhookPath, replyEventTypes: REPLY_EVENT_TYPES });
+        sendJson(res, 200, {
+          ok: true,
+          plugin: "smartlead",
+          mode: "mapped-hook-forwarder",
+          webhookPath,
+          forwardsToHookPath: `/hooks/${DEFAULT_OPENCLAW_MAPPED_HOOK_NAME}`,
+          replyEventTypes: REPLY_EVENT_TYPES,
+        });
         return;
       }
 
@@ -366,6 +425,8 @@ export default function registerSmartleadPlugin(api: any) {
       }
       seenWebhookEvents.set(eventKey, Date.now());
 
+      const forwardPayload = buildForwardPayload({ ctx, eventKey, webhookPath });
+
       // Respond to Smartlead immediately, then forward async.
       // This prevents Smartlead retries if openclaw is slow or misconfigured.
       sendJson(res, 202, {
@@ -376,7 +437,12 @@ export default function registerSmartleadPlugin(api: any) {
         lead_email: ctx.leadEmail ?? null,
       });
 
-      void forwardToHookAgent({ cfg, apiConfig: api.config, ctx, logger: api.logger });
+      void forwardToHookAgent({
+        cfg,
+        apiConfig: api.config,
+        ctx: { ...ctx, payload: forwardPayload },
+        logger: api.logger,
+      });
     },
   });
 }

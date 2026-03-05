@@ -45,10 +45,11 @@ smartlead <group> <command> --help
 Prefer curated commands (`campaigns`, `leads`, `webhooks`) over `raw`. Use `raw` only when the
 CLI does not expose the endpoint you need yet.
 
-For `openclaw-smartlead` plugin setup, keep config minimal unless there is a clear reason not to:
-- usually set only `hookChannel` (plus optional `webhookSecret`)
-- `openclawAgentHookUrl` / `openclawHookToken` are typically auto-derived from OpenClaw hooks config
-- avoid inventing extra hook parameters unless the plugin `openclaw.plugin.json` or `--help`/docs show them
+For `openclaw-smartlead` plugin setup, keep plugin config minimal unless there is a clear reason not to:
+- usually set only `webhookSecret` (plugin ingress auth)
+- plugin forwards normalized Smartlead payloads to OpenClaw `/hooks/smartlead` by default
+- prompt text / delivery channel / branching logic should live in OpenClaw `hooks.mappings` (or a hook transform), not plugin config
+- `openclawHookUrl` / `openclawHookToken` are typically auto-derived from OpenClaw hooks config
 
 ## Common Workflows
 
@@ -80,8 +81,12 @@ smartlead campaigns leads patch <campaign_id> <lead_id> --first-name "Updated"
 
 ### Reply Alert Workflow (EMAIL_REPLY webhook event)
 
-When an EMAIL_REPLY webhook fires, the agent receives a prompt with resolved fields.
-Always follow this sequence:
+When an EMAIL_REPLY webhook fires through `openclaw-smartlead`, your OpenClaw hook mapping/transform
+should construct the prompt. The forwarded payload includes flat fields like `campaign_id`,
+`lead_id`, `lead_email`, `reply_category`, `preview_text`, `message_id`, `sequence_number`,
+plus `payload` (sanitized raw Smartlead payload).
+
+When responding to the hook prompt, always follow this sequence:
 
 1. Extract `campaign_id` and `lead_id` from the prompt context.
    - `lead_id` comes from `sl_email_lead_id` (not `sl_email_lead_map_id`).
@@ -118,6 +123,11 @@ Example `webhook.json`:
 
 Use `smartlead webhooks upsert --help` for the current allowed `event_types`.
 `categories` are Smartlead workspace lead-category labels (for example `Interested`), not webhook event types.
+
+For OpenClaw side setup, prefer:
+- plugin route `/smartlead/webhook` for Smartlead ingress/auth/dedupe
+- OpenClaw `hooks.mappings` on `/hooks/smartlead` for prompt templates and branching
+- optional hook transform for deterministic routing like positive/negative/OOO handling
 
 ## Webhook Payload Fields (EMAIL_REPLY)
 

@@ -28,26 +28,34 @@ else
 fi
 
 echo ""
-echo "Recommended OpenClaw config (hooks + plugin):"
+echo "Recommended OpenClaw config (hooks mapping + plugin):"
 cat <<EOF
 {
   "hooks": {
     "enabled": true,
     "token": "\${OPENCLAW_HOOKS_TOKEN}",
-    "path": "/hooks"
+    "path": "/hooks",
+    "mappings": [
+      {
+        "id": "smartlead-reply",
+        "match": { "path": "smartlead", "source": "smartlead" },
+        "action": "agent",
+        "wakeMode": "now",
+        "name": "Smartlead Reply",
+        "sessionKey": "hook:smartlead:{{campaign_id}}:{{lead_id}}",
+        "messageTemplate": "New lead answer\\nCampaign: {{campaign_name}} ({{campaign_id}})\\nLead: {{lead_email}}\\nPreview: {{preview_text}}\\n\\nFetch and summarize prior conversation using smartlead CLI.",
+        "deliver": true,
+        "channel": "slack"
+      }
+    ]
   },
   "plugins": {
     "entries": {
       "smartlead": {
         "enabled": true,
         "config": {
-          "apiKey": "\${SMARTLEAD_API_KEY}",
-          "inboundWebhookPath": "/smartlead/webhook",
-          "openclawAgentHookUrl": "${GATEWAY_BASE_URL}/hooks/agent",
-          "openclawHookToken": "\${OPENCLAW_HOOKS_TOKEN}",
-          "hookChannel": "slack",
-          "hookTo": "C0123456789",
-          "replyEventTypes": ["EMAIL_REPLY"]
+          "webhookSecret": "<optional-smartlead-secret>",
+          "inboundWebhookPath": "/smartlead/webhook"
         }
       }
     }
@@ -63,10 +71,15 @@ cat <<EOF
   "name": "OpenClaw Reply Alerts",
   "webhook_url": "${SMARTLEAD_WEBHOOK_PUBLIC_URL}",
   "event_types": ["EMAIL_REPLY"],
-  "categories": []
+  "categories": ["Interested"]
 }
 EOF
 
+echo ""
+echo "Optional branching transform:"
+echo "  copy ${PLUGIN_DIR}/examples/hooks-transforms/smartlead-reply-branch.example.js \\"
+echo "    ~/.openclaw/hooks/transforms/smartlead-reply-branch.js"
+echo "  then set hooks.mappings[].transform.module = \"smartlead-reply-branch.js\""
 echo ""
 echo "Optional: install smartlead-cli for manual debugging (not required by the plugin):"
 if command -v uv >/dev/null 2>&1; then
@@ -82,4 +95,4 @@ echo "Next steps:"
 echo "1) Set SMARTLEAD_API_KEY and OPENCLAW_HOOKS_TOKEN"
 echo "2) Add the config snippet to your OpenClaw config"
 echo "3) Create/update the Smartlead campaign webhook to point at /smartlead/webhook"
-echo "4) Test with a Smartlead EMAIL_REPLY webhook"
+echo "4) Test with a Smartlead EMAIL_REPLY webhook (plugin -> /hooks/smartlead mapping)"

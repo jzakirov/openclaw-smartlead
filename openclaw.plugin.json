@@ -1,26 +1,23 @@
 {
   "id": "smartlead",
   "name": "Smartlead",
-  "description": "Receives Smartlead webhook events and forwards EMAIL_REPLY events to an openclaw agent. API interaction is done by the agent via the smartlead CLI.",
-  "version": "0.2.0",
+  "description": "Receives Smartlead webhook events, normalizes EMAIL_REPLY payloads, and forwards them to an OpenClaw mapped hook (/hooks/smartlead by default).",
+  "version": "0.3.0",
+  "skills": ["skills/smartlead"],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "hookChannel":          { "type": "string" },
-      "hookAgentId":          { "type": "string" },
       "webhookSecret":        { "type": "string" },
-      "openclawAgentHookUrl": { "type": "string" },
+      "openclawHookUrl":      { "type": "string" },
       "openclawHookToken":    { "type": "string" },
       "inboundWebhookPath":   { "type": "string" }
     },
     "required": []
   },
   "uiHints": {
-    "hookChannel":          { "label": "Delivery Channel", "help": "Usually set this for reply alerts (for example: slack, telegram, discord). If omitted, OpenClaw uses hooks default channel behavior (`last`)." },
-    "hookAgentId":          { "label": "Hook Agent ID", "advanced": true, "help": "Optional: route webhook work to a specific agent. OpenClaw can also use the default agent." },
     "webhookSecret":        { "label": "Smartlead Webhook Secret", "sensitive": true, "help": "Optional. Matched against Smartlead payload `secret_key` or secret headers." },
-    "openclawAgentHookUrl": { "label": "OpenClaw /hooks/agent URL", "advanced": true, "help": "Usually auto-derived from OpenClaw `gateway.port` + `hooks.path`.", "placeholder": "http://127.0.0.1:18789/hooks/agent" },
+    "openclawHookUrl":      { "label": "OpenClaw Mapped Hook URL", "advanced": true, "help": "Usually auto-derived to /hooks/smartlead from OpenClaw `gateway.port` + `hooks.path`.", "placeholder": "http://127.0.0.1:18789/hooks/smartlead" },
     "openclawHookToken":    { "label": "OpenClaw Hook Token", "sensitive": true, "advanced": true, "help": "Usually auto-derived from OpenClaw `hooks.token`." },
     "inboundWebhookPath":   { "label": "Inbound Webhook Path", "advanced": true, "placeholder": "/smartlead/webhook" }
   }

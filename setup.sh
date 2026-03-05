@@ -73,14 +73,29 @@ WEBHOOK_PATH="/smartlead/webhook"
 # ─── Print openclaw config snippet ───────────────────────────────────────────
 
 echo "══════════════════════════════════════════════════════════════════════════"
-echo "Step 1 — Enable hooks in your openclaw config (~/.openclaw/config.json)"
+echo "Step 1 — Enable hooks + add a Smartlead mapping in your openclaw config"
 echo "══════════════════════════════════════════════════════════════════════════"
 cat <<JSON
 {
   "hooks": {
     "enabled": true,
     "token": "<generate with: openssl rand -hex 32>",
-    "path": "${HOOKS_PATH}"
+    "path": "${HOOKS_PATH}",
+    "defaultSessionKey": "hook:ingress",
+    "allowRequestSessionKey": false,
+    "mappings": [
+      {
+        "id": "smartlead-reply",
+        "match": { "path": "smartlead", "source": "smartlead" },
+        "action": "agent",
+        "wakeMode": "now",
+        "name": "Smartlead Reply",
+        "sessionKey": "hook:smartlead:{{campaign_id}}:{{lead_id}}",
+        "messageTemplate": "New lead answer\\nCampaign: {{campaign_name}} ({{campaign_id}})\\nLead: {{lead_email}}\\nPreview: {{preview_text}}\\n\\nFetch and summarize prior conversation using smartlead CLI.",
+        "deliver": true,
+        "channel": "last"
+      }
+    ]
   },
   "plugins": {
     "enabled": true,
@@ -90,18 +105,13 @@ cat <<JSON
 JSON
 echo ""
 echo "⚠️   hooks.token is REQUIRED. The plugin auto-derives the hook URL and"
-echo "    token from this config — no extra plugin config needed for defaults."
-echo ""
-echo "Optional: to use a deterministic session key per event (useful for"
-echo "de-duplication across restarts), also add:"
-echo '  "allowRequestSessionKey": true'
-echo '  "allowedSessionKeyPrefixes": ["hook:"]'
+echo "    token from this config and forwards to ${HOOKS_PATH}/smartlead by default."
 echo ""
 
 # ─── Plugin config (if overrides needed) ─────────────────────────────────────
 
 echo "══════════════════════════════════════════════════════════════════════════"
-echo "Step 2 — Plugin config (only needed to override defaults)"
+echo "Step 2 — Plugin config (minimal; only webhook ingress settings)"
 echo "══════════════════════════════════════════════════════════════════════════"
 echo ""
 echo "Add under plugins.entries.smartlead.config if you need to override:"
@@ -112,9 +122,7 @@ cat <<JSON
       "smartlead": {
         "enabled": true,
         "config": {
-          "hookChannel": "telegram",
-          "webhookSecret": "<optional: set same value in Smartlead>",
-          "replyEventTypes": ["EMAIL_REPLY"]
+          "webhookSecret": "<optional: set same value in Smartlead>"
         }
       }
     }
@@ -123,7 +131,7 @@ cat <<JSON
 JSON
 echo ""
 echo "Default webhook path: ${WEBHOOK_PATH}"
-echo "Hook URL is auto-derived: http://${GATEWAY_HOST}:${GATEWAY_PORT}${HOOKS_PATH}/agent"
+echo "Mapped hook URL is auto-derived: http://${GATEWAY_HOST}:${GATEWAY_PORT}${HOOKS_PATH}/smartlead"
 echo ""
 
 # ─── Smartlead webhook setup ──────────────────────────────────────────────────
@@ -150,9 +158,15 @@ cat <<'CMD'
     "name": "OpenClaw Reply Alerts",
     "webhook_url": "https://<public-url>/smartlead/webhook",
     "event_types": ["EMAIL_REPLY"],
-    "categories": []
+    "categories": ["Interested"]
   }'
 CMD
+echo ""
+echo "Note: categories are Smartlead lead category labels from your workspace."
+echo ""
+echo "Optional branching logic: copy examples/hooks-transforms/smartlead-reply-branch.example.js"
+echo "to ~/.openclaw/hooks/transforms/smartlead-reply-branch.js and set"
+echo 'hooks.mappings[].transform.module = "smartlead-reply-branch.js"'
 echo ""
 
 # ─── Smoke test ───────────────────────────────────────────────────────────────
@@ -181,4 +195,4 @@ CURL
 echo ""
 echo "Expected response: {\"ok\":true, \"event_type\":\"EMAIL_REPLY\", ...}"
 echo ""
-echo "✅  Setup complete. Restart openclaw to activate the plugin."
+echo "✅  Setup complete. Restart openclaw to activate the plugin + hook mapping."
