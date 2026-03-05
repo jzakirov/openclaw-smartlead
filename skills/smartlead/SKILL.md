@@ -1,5 +1,6 @@
 ---
 name: smartlead
+version: 0.3.2
 description: "Smartlead email outreach CLI — campaigns, leads, webhooks, message history. Use when managing outreach campaigns or processing lead replies."
 metadata:
   {
