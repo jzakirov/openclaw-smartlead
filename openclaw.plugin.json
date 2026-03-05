@@ -2,7 +2,7 @@
   "id": "smartlead",
   "name": "Smartlead",
   "description": "Receives Smartlead webhook events, normalizes EMAIL_REPLY payloads, and forwards them to an OpenClaw mapped hook (/hooks/smartlead by default).",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "skills": ["skills/smartlead"],
   "configSchema": {
     "type": "object",

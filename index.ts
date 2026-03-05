@@ -75,37 +75,26 @@ function getHeader(req: IncomingMessage, name: string): string {
 // ─── Config resolution ────────────────────────────────────────────────────────
 
 function resolveWebhookPath(cfg: SmartleadPluginConfig): string {
-  return normalizePath(
-    trimString(cfg.inboundWebhookPath) ||
-      trimString(process.env.SMARTLEAD_WEBHOOK_PATH) ||
-      DEFAULT_INBOUND_WEBHOOK_PATH,
-  );
+  return normalizePath(trimString(cfg.inboundWebhookPath) || DEFAULT_INBOUND_WEBHOOK_PATH);
 }
 
 function resolveWebhookSecret(cfg: SmartleadPluginConfig): string {
-  return trimString(cfg.webhookSecret) || trimString(process.env.SMARTLEAD_WEBHOOK_SECRET);
+  return trimString(cfg.webhookSecret);
 }
 
-// Tries to derive the mapped hook URL from api.config (same gateway process)
+// Derives the mapped hook URL from api.config (same gateway process)
 // when not explicitly configured. This avoids duplicating port/path.
 function resolveHookUrl(cfg: SmartleadPluginConfig, apiConfig: any): string {
-  const explicit =
-    trimString(cfg.openclawHookUrl) ||
-    trimString(process.env.OPENCLAW_SMARTLEAD_HOOK_URL) ||
-    trimString(process.env.OPENCLAW_SMARTLEAD_AGENT_HOOK_URL); // legacy env fallback
+  const explicit = trimString(cfg.openclawHookUrl);
   if (explicit) return explicit;
   const port = coerceNumber(apiConfig?.gateway?.port) ?? 18789;
   const hooksPath = trimString(apiConfig?.hooks?.path) || "/hooks";
   return `http://127.0.0.1:${port}${normalizePath(hooksPath)}/${DEFAULT_OPENCLAW_MAPPED_HOOK_NAME}`;
 }
 
-// Tries to derive the hook token from api.config when not explicitly configured.
+// Derives the hook token from api.config when not explicitly configured.
 function resolveHookToken(cfg: SmartleadPluginConfig, apiConfig: any): string {
-  return (
-    trimString(cfg.openclawHookToken) ||
-    trimString(process.env.OPENCLAW_HOOKS_TOKEN) ||
-    trimString(apiConfig?.hooks?.token)
-  );
+  return trimString(cfg.openclawHookToken) || trimString(apiConfig?.hooks?.token);
 }
 
 // ─── Body reading ─────────────────────────────────────────────────────────────
